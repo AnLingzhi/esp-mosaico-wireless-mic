@@ -42,6 +42,10 @@ static CFMachPortRef observationTap;
 static CFRunLoopSourceRef observationSource;
 static BOOL testMode;
 static unsigned testPrefixes, testFnDowns, testFnUps;
+static CGKeyCode testPrefixCodes[10];
+static CGEventFlags testPrefixFlags[10];
+static bool testPrefixDown[10];
+static unsigned testPrefixEventCount;
 static CFRunLoopSourceRef prefixSource;
 static _Atomic bool fnDownTracked;
 
@@ -49,6 +53,12 @@ static dispatch_queue_t diagnosticQueue;
 static NSString *diagnosticPath;
 static _Atomic unsigned diagnosticPending;
 static BOOL diagnosticEnabled;
+static int mappingResult = -1;
+
+static BOOL heartbeatDue(NSTimeInterval last, NSTimeInterval now)
+{
+    return last == 0 || now - last >= 60.0;
+}
 
 static NSString *eventLogPath(void)
 {
@@ -78,6 +88,15 @@ static void logControl(NSString *message)
             static NSDateFormatter *formatter;
             if (!lines) {
                 lines = [NSMutableArray array];
+                NSString *existing = [NSString stringWithContentsOfFile:diagnosticPath
+                    encoding:NSUTF8StringEncoding error:nil];
+                if (existing.length) {
+                    NSArray<NSString *> *previous = [existing componentsSeparatedByString:@"\n"];
+                    NSUInteger count = previous.count;
+                    if ([previous.lastObject isEqualToString:@""]) count--;
+                    NSUInteger start = count > 399 ? count - 399 : 0;
+                    for (NSUInteger i = start; i < count; ++i) [lines addObject:previous[i]];
+                }
                 formatter = [NSDateFormatter new];
                 formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
             }
@@ -295,35 +314,64 @@ static void releaseSyntheticFn(void)
     if (atomic_exchange(&syntheticFnDown, false)) postFnState(false);
 }
 
-static void postPrefix(void)
+static void postPrefixKey(CGEventTapProxy proxy, CGEventSourceRef source, CGKeyCode code,
+                          bool down, CGEventFlags flags)
 {
-    if (testMode) { testPrefixes++; return; }
-    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStatePrivate);
-    if (!source) { logControl(@"前置键发送失败：无法创建事件源"); return; }
-    CGEventRef down = CGEventCreateKeyboardEvent(source, prefixExecutor.keyCode, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(source, prefixExecutor.keyCode, false);
-    logControl([NSString stringWithFormat:@"投递前置组合键：keyCode=0x%02x，修饰标志=0x%llx",
-                prefixExecutor.keyCode, (unsigned long long)prefixExecutor.flags]);
-    if (!down || !up) logControl(@"前置键发送不完整：键盘事件创建失败");
-    if (down) {
-        CGEventSetFlags(down, prefixExecutor.flags);
-        CGEventSetIntegerValueField(down, kCGEventSourceUserData, (int64_t)syntheticMagic);
-        CGEventPost(kCGHIDEventTap, down);
-        CFRelease(down);
+    if (testMode) {
+        if (testPrefixEventCount < 10) {
+            testPrefixCodes[testPrefixEventCount] = code;
+            testPrefixFlags[testPrefixEventCount] = flags;
+            testPrefixDown[testPrefixEventCount] = down;
+        }
+        testPrefixEventCount++;
+        return;
     }
-    if (up) {
-        CGEventSetFlags(up, prefixExecutor.flags);
-        CGEventSetIntegerValueField(up, kCGEventSourceUserData, (int64_t)syntheticMagic);
-        CGEventPost(kCGHIDEventTap, up);
-        CFRelease(up);
+    CGEventRef event = CGEventCreateKeyboardEvent(source, code, down);
+    if (!event) {
+        logControl(@"前置组合键发送不完整：无法创建键盘事件");
+        return;
     }
-    CFRelease(source);
+    CGEventSetFlags(event, flags);
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, (int64_t)syntheticMagic);
+    CGEventTapPostEvent(proxy, event);
+    CFRelease(event);
+}
+
+static void postPrefix(CGEventTapProxy proxy)
+{
+    if (testMode) testPrefixes++;
+    CGEventSourceRef source = testMode ? NULL : CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    if (!testMode && !source) { logControl(@"前置键发送失败：无法创建事件源"); return; }
+    static const struct { CGEventFlags flag; CGKeyCode code; } modifiers[] = {
+        {kCGEventFlagMaskCommand, 0x37}, {kCGEventFlagMaskAlternate, 0x3a},
+        {kCGEventFlagMaskControl, 0x3b}, {kCGEventFlagMaskShift, 0x38},
+    };
+    CGEventFlags active = 0;
+    for (unsigned i = 0; i < sizeof(modifiers) / sizeof(modifiers[0]); ++i) {
+        if (prefixExecutor.flags & modifiers[i].flag) {
+            active |= modifiers[i].flag;
+            postPrefixKey(proxy, source, modifiers[i].code, true, active);
+        }
+    }
+    postPrefixKey(proxy, source, prefixExecutor.keyCode, true, active);
+    postPrefixKey(proxy, source, prefixExecutor.keyCode, false, active);
+    for (int i = (int)(sizeof(modifiers) / sizeof(modifiers[0])) - 1; i >= 0; --i) {
+        if (prefixExecutor.flags & modifiers[i].flag) {
+            active &= ~modifiers[i].flag;
+            postPrefixKey(proxy, source, modifiers[i].code, false, active);
+        }
+    }
+    if (source) {
+        logControl([NSString stringWithFormat:@"已向监听下游投递完整前置组合键：keyCode=0x%02x，修饰标志=0x%llx（不代表前台应用已响应）",
+                    prefixExecutor.keyCode, (unsigned long long)prefixExecutor.flags]);
+        CFRelease(source);
+    }
 }
 
 static CGEventRef prefix_event_callback(CGEventTapProxy proxy, CGEventType type,
                                         CGEventRef event, void *context)
 {
-    (void)proxy; (void)context;
+    (void)context;
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         logControl(@"事件监听被系统停用；取消延时、释放 Fn 并重新启用监听");
         atomic_fetch_add(&prefixGeneration, 1);
@@ -367,7 +415,7 @@ static CGEventRef prefix_event_callback(CGEventTapProxy proxy, CGEventType type,
     if (down) {
         if (!repeatEvent && !atomic_exchange(&fnDownTracked, true)) {
             const uint64_t generation = atomic_fetch_add(&prefixGeneration, 1) + 1;
-            postPrefix();
+            postPrefix(proxy);
             const uint32_t delay = MAX(prefixExecutor.delayMs, 20);
             logControl([NSString stringWithFormat:@"拦截原按键；等待 %u 毫秒后投递 Fn 按下", delay]);
             // Keep transitions, config updates and delayed actions on the event-tap run loop.
@@ -388,14 +436,26 @@ static CGEventRef prefix_event_callback(CGEventTapProxy proxy, CGEventType type,
 static void writeRuntimeState(NSString *state)
 {
     static NSString *previous;
-    if (![previous isEqual:state]) {
-        logControl([NSString stringWithFormat:@"守护进程状态：%@；辅助功能权限=%d", state, AXIsProcessTrusted()]);
-        previous = [state copy];
+    static NSTimeInterval lastWrite;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL changed = ![previous isEqual:state];
+    if (!changed && !heartbeatDue(lastWrite, now)) return;
+    BOOL trusted = AXIsProcessTrusted();
+    if (changed) {
+        logControl([NSString stringWithFormat:@"守护进程状态：%@；辅助功能权限=%d", state, trusted]);
+    } else {
+        logControl([NSString stringWithFormat:@"存活心跳：pid=%d，状态=%@，键盘映射=%d，监听有效=%d，监听启用=%d，系统回读启用=%d，辅助功能=%d，按键按住=%d",
+                    getpid(), state, mappingResult, prefixTap && CFMachPortIsValid(prefixTap),
+                    prefixTap && CGEventTapIsEnabled(prefixTap),
+                    observationTap && CFMachPortIsValid(observationTap) && CGEventTapIsEnabled(observationTap),
+                    trusted, atomic_load(&fnDownTracked)]);
     }
+    previous = [state copy];
+    lastWrite = now;
     NSURL *url = [NSURL fileURLWithPath:[NSHomeDirectory()
         stringByAppendingPathComponent:@"Library/Application Support/MosaicoMic/runtime-status.json"]];
     NSDictionary *value = @{@"state": state, @"pid": @(getpid()),
-                            @"accessibility": @(AXIsProcessTrusted()),
+                            @"accessibility": @(trusted),
                             @"updatedAt": [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]]};
     NSData *data = [NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingPrettyPrinted error:nil];
     [data writeToURL:url options:NSDataWritingAtomic error:nil];
@@ -422,7 +482,6 @@ static CGEventRef observePostedEvent(CGEventTapProxy proxy, CGEventType type,
 static BOOL installPrefixTap(void)
 {
     static BOOL reported;
-    if (prefixTap) return YES;
     if (!AXIsProcessTrusted()) {
         static BOOL prompted;
         if (!prompted) {
@@ -435,6 +494,28 @@ static BOOL installPrefixTap(void)
         writeRuntimeState(@"permission_required");
         return NO;
     }
+    if (prefixTap && !CFMachPortIsValid(prefixTap)) {
+        logControl(@"事件监听已失效；销毁旧监听并重新创建");
+        if (prefixSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), prefixSource, kCFRunLoopCommonModes);
+            CFRelease(prefixSource);
+            prefixSource = NULL;
+        }
+        CFRelease(prefixTap);
+        prefixTap = NULL;
+    }
+    if (prefixTap) {
+        if (!CGEventTapIsEnabled(prefixTap)) {
+            logControl(@"事件监听已停用；尝试重新启用");
+            CGEventTapEnable(prefixTap, true);
+        }
+        if (!CGEventTapIsEnabled(prefixTap)) {
+            writeRuntimeState(@"event_tap_failed");
+            return NO;
+        }
+        writeRuntimeState(@"event_tap_active");
+        return YES;
+    }
     if (!prefixQueue) prefixQueue = dispatch_queue_create("local.mosaico.prefix", DISPATCH_QUEUE_SERIAL);
     const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) |
                              CGEventMaskBit(kCGEventFlagsChanged);
@@ -443,10 +524,16 @@ static BOOL installPrefixTap(void)
     if (!prefixTap) { writeRuntimeState(@"event_tap_failed"); return NO; }
     prefixSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, prefixTap, 0);
     if (!prefixSource) {
-        CFRelease(prefixTap); prefixTap = NULL; return NO;
+        CFRelease(prefixTap); prefixTap = NULL;
+        writeRuntimeState(@"event_tap_failed");
+        return NO;
     }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), prefixSource, kCFRunLoopCommonModes);
     CGEventTapEnable(prefixTap, true);
+    if (!CGEventTapIsEnabled(prefixTap)) {
+        writeRuntimeState(@"event_tap_failed");
+        return NO;
+    }
     observationTap = CGEventTapCreate(kCGSessionEventTap, kCGTailAppendEventTap,
         kCGEventTapOptionListenOnly, mask, observePostedEvent, NULL);
     if (observationTap) {
@@ -469,7 +556,7 @@ static BOOL configurePrefixExecutor(NSDictionary *draft)
 {
     static NSDictionary *appliedDraft;
     if (draft && [draft isEqual:appliedDraft])
-        return prefixExecutor.enabled ? installPrefixTap() : YES;
+        return prefixExecutor.enabled ? installPrefixTap() : (writeRuntimeState(@"disabled"), YES);
     appliedDraft = [draft copy];
     atomic_fetch_add(&prefixGeneration, 1);
     atomic_store(&fnDownTracked, false);
@@ -694,7 +781,9 @@ int main(int argc, const char *argv[])
     @autoreleasepool {
         if (argc == 2 && strcmp(argv[1], "--test-events") == 0) {
             testMode = YES;
-            prefixExecutor = (prefix_executor_t){.enabled = true, .delayMs = 20};
+            prefixExecutor = (prefix_executor_t){.enabled = true, .keyCode = keyCodeL,
+                .flags = kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl,
+                .delayMs = 20};
             CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
             if (!source) return 1;
             CGEventRef event = CGEventCreateKeyboardEvent(source, keyCodeFunction, true);
@@ -708,7 +797,20 @@ int main(int argc, const char *argv[])
                 CGEventSetFlags(event, 0);
                 prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
             }
-            BOOL ok = testPrefixes == 2 && testFnDowns == 2 && testFnUps == 2 && !fnDownTracked;
+            const CGKeyCode expectedCodes[] = {0x37, 0x3a, 0x3b, keyCodeL, keyCodeL, 0x3b, 0x3a, 0x37};
+            const CGEventFlags expectedFlags[] = {kCGEventFlagMaskCommand,
+                kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate,
+                kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl,
+                kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl,
+                kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl,
+                kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate,
+                kCGEventFlagMaskCommand, 0};
+            BOOL ok = testPrefixes == 2 && testFnDowns == 2 && testFnUps == 2 && !fnDownTracked &&
+                      testPrefixEventCount == 16;
+            for (unsigned i = 0; i < 8; ++i) {
+                ok = ok && testPrefixCodes[i] == expectedCodes[i] &&
+                     testPrefixFlags[i] == expectedFlags[i] && testPrefixDown[i] == (i < 4);
+            }
             CGEventSetFlags(event, kCGEventFlagMaskSecondaryFn);
             prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
             CGEventSetFlags(event, 0);
@@ -727,16 +829,29 @@ int main(int argc, const char *argv[])
         if (argc == 2 && strcmp(argv[1], "--test-log") == 0) {
             NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
                               [NSString stringWithFormat:@"mosaico-log-%@.txt", NSUUID.UUID.UUIDString]];
+            [@"prior run: before restart\n" writeToFile:path atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
             initializeDiagnostics(path);
+            logControl(@"first run after restart");
+            dispatch_sync(diagnosticQueue, ^{});
+            NSString *initial = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            BOOL retained = [initial containsString:@"prior run: before restart"] &&
+                            [initial containsString:@"first run after restart"];
             for (unsigned i = 0; i < 405; ++i) {
                 logControl([NSString stringWithFormat:@"测试日志 %u", i]);
                 dispatch_sync(diagnosticQueue, ^{});
             }
             NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-            BOOL ok = [text componentsSeparatedByString:@"\n"].count == 400 &&
+            BOOL ok = retained && [text componentsSeparatedByString:@"\n"].count == 400 &&
                       [text containsString:@"测试日志 404"] && ![text containsString:@"测试日志 0\n"];
             [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
             puts(ok ? "bounded diagnostic log: PASS" : "bounded diagnostic log: FAIL");
+            return ok ? 0 : 1;
+        }
+        if (argc == 2 && strcmp(argv[1], "--test-heartbeat") == 0) {
+            BOOL ok = heartbeatDue(0, 120) && !heartbeatDue(100, 159.9) &&
+                      heartbeatDue(100, 160) && heartbeatDue(100, 170);
+            puts(ok ? "heartbeat interval: PASS" : "heartbeat interval: FAIL");
             return ok ? 0 : 1;
         }
         if (argc == 2 && strcmp(argv[1], "--request-access") == 0) {
@@ -745,6 +860,12 @@ int main(int argc, const char *argv[])
                    IOHIDCheckAccess(kIOHIDRequestTypePostEvent) == kIOHIDAccessTypeGranted,
                    IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted);
             return AXIsProcessTrusted() ? 0 : 2;
+        }
+        if (argc == 2 && strcmp(argv[1], "--access-status") == 0) {
+            printf("AXTrusted=%d postEvent=%d listenEvent=%d\n", AXIsProcessTrusted(),
+                   IOHIDCheckAccess(kIOHIDRequestTypePostEvent) == kIOHIDAccessTypeGranted,
+                   IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted);
+            return 0;
         }
         if (argc == 1 || (argc == 2 && strcmp(argv[1], "--settings") == 0)) {
             [NSApplication sharedApplication];
@@ -780,12 +901,12 @@ int main(int argc, const char *argv[])
         BOOL apply = watch || (argc == 2 && strcmp(argv[1], "--apply") == 0);
         if (watch) {
             initializeDiagnostics(eventLogPath());
-            logControl(@"守护进程启动；日志最多保留本次运行最近 400 行；投递事件不等于应用已响应");
+            logControl([NSString stringWithFormat:@"守护进程启动：pid=%d；日志最多保留本次运行最近 400 行；投递事件不等于应用已响应", getpid()]);
             [NSApplication sharedApplication];
             [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         }
         if (argc != 2 || (!apply && strcmp(argv[1], "--status") != 0)) {
-            fputs("usage: mosaico-fn --settings|--request-access|--status|--apply|--watch|--test-config\n", stderr); return 1;
+            fputs("usage: mosaico-fn --settings|--request-access|--access-status|--status|--apply|--watch|--test-config|--test-events|--test-log|--test-heartbeat\n", stderr); return 1;
         }
         setbuf(stdout, NULL);
         signal(SIGTERM, stop_requested); signal(SIGINT, stop_requested);
@@ -796,6 +917,7 @@ int main(int argc, const char *argv[])
             @autoreleasepool {
                 result = process(apply);
                 if (watch) {
+                    mappingResult = result;
                     if (result != 0 && previousResult == 0) {
                         atomic_fetch_add(&prefixGeneration, 1);
                         atomic_store(&fnDownTracked, false);
@@ -822,6 +944,7 @@ int main(int argc, const char *argv[])
             }
         } while (watch && !stopped);
         if (watch) {
+            logControl([NSString stringWithFormat:@"守护进程正常退出：pid=%d，原因=%@", getpid(), stopped ? @"收到停止信号" : @"循环结束"]);
             atomic_fetch_add(&prefixGeneration, 1);
             releaseSyntheticFn();
             if (diagnosticQueue) dispatch_sync(diagnosticQueue, ^{});

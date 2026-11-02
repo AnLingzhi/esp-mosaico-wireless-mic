@@ -18,13 +18,18 @@ existing configuration disables saving to avoid overwriting it.
 
 When enabled, the `--watch` service installs a device-filtered CGEvent tap for
 the verified Mosaico Bluetooth keyboard type. On F18/Fn press it suppresses the
-original event, posts the configured prefix key and modifiers, waits the configured
-delay, and synthesizes an Fn hold; F18/Fn release synthesizes Fn release. Other
+original event, posts the modifier-down/key-down/key-up/modifier-up sequence
+through that tap's proxy, waits the configured delay, and synthesizes an Fn hold;
+F18/Fn release synthesizes Fn release. Other
 keyboards are filtered by keyboard type and synthetic events carry a private
 magic tag. The service requires macOS Accessibility and Input Monitoring permission.
 TCC matches the exact signed application fingerprint, so do not re-sign or replace
 the installed app without re-authorizing it. Runtime state is written atomically to
 `~/Library/Application Support/MosaicoMic/runtime-status.json`.
+The watcher rechecks its event tap every polling cycle. It requests re-enablement
+if disabled and recreates an invalid port. Re-enabling a previously disabled
+prefix configuration also refreshes the runtime status instead of leaving a
+stale `disabled` result.
 
 Hardware acceptance still needs a real F18 press with Codex frontmost. A synthetic
 F18 was observed entering the tap, but keyboard synthesis visibility across event
@@ -37,7 +42,7 @@ round trips. UI layout and interactive save/reopen still need visual validation.
 
 The Chinese settings window includes a read-only, selectable log panel refreshed
 every 500 ms. The watch process asynchronously writes `key-events.log` beside
-the configuration, retaining the latest 400 lines from the current process.
+the configuration, retaining the latest 400 lines across process restarts.
 Only F18/Fn candidate events, configured prefix actions, mapping/permission
 state and execution stages are logged; ordinary text and other keys are not.
 Event delivery means CGEventPost was called, not that dictation or focus succeeded.
@@ -47,5 +52,19 @@ An independent listen-only session event tap reports observation of this helper'
 marked synthetic events; this does not prove focus changes or application handling.
 `--test-events` covers repeated holds, early release cancellation and raw F18 release
 without posting actual keyboard events.
-`--test-log` checks bounded retention using a temporary file without posting keys.
+`--test-log` checks cross-restart retention and the 400-line bound using a temporary
+file without posting keys.
+The watcher writes a heartbeat every 60 seconds and refreshes
+`runtime-status.json` even when its state is unchanged. The heartbeat reports
+the PID, keyboard mapping result (0 verified, 3 disconnected), tap validity,
+tap enabled state, session observer, Accessibility and held-key state. If the
+main loop stalls or the process exits unexpectedly, the heartbeat stops; check
+the process/LaunchAgent separately to distinguish those cases. A normal exit
+is logged before the diagnostics queue is drained. `--test-heartbeat` checks
+the interval without creating a live event tap.
 Replacing an ad-hoc signed executable can require macOS permission reapproval.
+The read-only session observer may itself be disabled under load; absence of a
+readback line alone cannot prove that the foreground app rejected a shortcut.
+After rebuilding, confirm the LaunchAgent process has Accessibility permission
+before replacing the previously authorized binary. A successful terminal
+`--access-status` check does not establish the LaunchAgent's permission.

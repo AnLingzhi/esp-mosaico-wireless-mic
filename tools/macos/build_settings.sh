@@ -31,4 +31,5 @@ codesign --force --sign - "$APP"
 "$APP/Contents/MacOS/mosaico-fn" --test-config
 "$APP/Contents/MacOS/mosaico-fn" --test-events
 "$APP/Contents/MacOS/mosaico-fn" --test-log
+"$APP/Contents/MacOS/mosaico-fn" --test-heartbeat
 printf '%s\n' "$APP"
