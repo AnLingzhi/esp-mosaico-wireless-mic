@@ -23,6 +23,11 @@ through that tap's proxy, waits the configured delay, and synthesizes an Fn hold
 F18/Fn release synthesizes Fn release. Other
 keyboards are filtered by keyboard type and synthetic events carry a private
 magic tag. The service requires macOS Accessibility and Input Monitoring permission.
+Recent live logs show macOS reports the Mosaico Fn event as keyboard type 91
+after reconnect, rather than the earlier type 40. Both observed types are
+accepted only while the verified Mosaico HID mapping is present; other types
+are ignored. Keyboard type is not a unique device ID, so another keyboard
+with the same type could still trigger the mapping while Mosaico is connected.
 TCC matches the exact signed application fingerprint, so do not re-sign or replace
 the installed app without re-authorizing it. Runtime state is written atomically to
 `~/Library/Application Support/MosaicoMic/runtime-status.json`.

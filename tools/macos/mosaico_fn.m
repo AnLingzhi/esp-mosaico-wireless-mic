@@ -19,6 +19,7 @@ static NSString *const destinationKey = @"HIDKeyboardModifierMappingDst";
 static const uint64_t sourceUsage = 0x70000006d;
 static const uint64_t fnUsage = 0xff00000003;
 static const int64_t mosaicoKeyboardType = 40;
+static const int64_t mosaicoReconnectedKeyboardType = 91;
 static const CGKeyCode keyCodeTab = 0x30;
 static const CGKeyCode keyCodeReturn = 0x24;
 static const CGKeyCode keyCodeEscape = 0x35;
@@ -393,11 +394,12 @@ static CGEventRef prefix_event_callback(CGEventTapProxy proxy, CGEventType type,
                     (long long)keyboardType, (long long)sourceState,
                     (CGEventGetFlags(event) & kCGEventFlagMaskSecondaryFn) != 0]);
     }
-    if (userData == (int64_t)syntheticMagic ||
+    if (userData == (int64_t)syntheticMagic || mappingResult != 0 ||
             (sourceState != kCGEventSourceStateHIDSystemState && sourceState != kCGEventSourceStateCombinedSessionState) ||
-            (keyboardType != mosaicoKeyboardType && !(keyboardType == 0 && sourceState == kCGEventSourceStateHIDSystemState))) {
+            (keyboardType != mosaicoKeyboardType && keyboardType != mosaicoReconnectedKeyboardType &&
+             !(keyboardType == 0 && sourceState == kCGEventSourceStateHIDSystemState))) {
         if (controlCandidate && !repeatEvent && userData != (int64_t)syntheticMagic)
-            logControl(@"忽略此 F18/Fn：来源或键盘类型未通过过滤（类型不是设备唯一标识）");
+            logControl(@"忽略此 F18/Fn：设备映射、来源或键盘类型未通过过滤（类型不是设备唯一标识）");
         return event;
     }
     const bool isFnKey = keyCode == keyCodeFunction || keyCode == keyCodeF18;
@@ -781,6 +783,7 @@ int main(int argc, const char *argv[])
     @autoreleasepool {
         if (argc == 2 && strcmp(argv[1], "--test-events") == 0) {
             testMode = YES;
+            mappingResult = 0;
             prefixExecutor = (prefix_executor_t){.enabled = true, .keyCode = keyCodeL,
                 .flags = kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskControl,
                 .delayMs = 20};
@@ -822,6 +825,22 @@ int main(int argc, const char *argv[])
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.08]];
             prefix_event_callback(NULL, kCGEventKeyUp, event, NULL);
             ok = ok && testPrefixes == 4 && testFnDowns == 3 && testFnUps == 3 && !fnDownTracked;
+            CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, keyCodeFunction);
+            CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, mosaicoReconnectedKeyboardType);
+            CGEventSetFlags(event, kCGEventFlagMaskSecondaryFn);
+            prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.08]];
+            CGEventSetFlags(event, 0);
+            prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
+            ok = ok && testPrefixes == 5 && testFnDowns == 4 && testFnUps == 4 && !fnDownTracked;
+            CGEventSetIntegerValueField(event, kCGEventSourceUserData, 0);
+            CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, 92);
+            CGEventSetFlags(event, kCGEventFlagMaskSecondaryFn);
+            prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
+            mappingResult = 3;
+            CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, mosaicoReconnectedKeyboardType);
+            prefix_event_callback(NULL, kCGEventFlagsChanged, event, NULL);
+            ok = ok && testPrefixes == 5 && testFnDowns == 4 && !fnDownTracked;
             CFRelease(event);
             puts(ok ? "Fn repeat cycles, short hold cancellation, F18 release: PASS" : "event tests: FAIL");
             return ok ? 0 : 1;
