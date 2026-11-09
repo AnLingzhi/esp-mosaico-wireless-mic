@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified for the expansion board's two keys and the BOOT button mapping.
 #include "app_controls.h"
 #include "app_hid.h"
 #include "button_gesture.h"
 #include "key_sequence.h"
 #include "bsp/esp_mosaico.h"
+#include "bsp/subboard.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mosaico_module_mgr.h"
 #include <string.h>
 
-#define INPUT_DEBOUNCE_MS 30U
 #define RECONNECT_MS 500U
+#define EXPANSION_CHECK_MS 250U
 #define HAPTIC_MS 35U
 #define VOICE_MASK 1U
 
@@ -26,6 +29,63 @@ static struct {
 } input;
 static TaskHandle_t control_task;
 static bool motor_ready;
+static bool expansion_available;
+
+typedef struct {
+    mosaico_module_lease_t lease;
+    gpio_num_t left_gpio;
+    gpio_num_t right_gpio;
+    button_input_t left;
+    button_input_t right;
+    bool armed;
+} expansion_keys_t;
+
+/* The control task owns the lease and GPIOs. The manager checks EEPROM in
+ * the background, so polling the keys never waits for I2C. */
+static void refresh_expansion_keys(expansion_keys_t *keys)
+{
+    if (keys->lease.id) {
+        static mosaico_module_mgr_info_t info;
+        if (mosaico_module_mgr_get_info(keys->lease.slot, &info) == ESP_OK &&
+                info.presence == MOSAICO_MODULE_PRESENCE_PRESENT &&
+                info.descriptor_state == MOSAICO_MODULE_DESCRIPTOR_VALID &&
+                info.eeprom.board_type == MOSAICO_BOARD_TYPE_INTERACT) {
+            return;
+        }
+        gpio_reset_pin(keys->left_gpio);
+        gpio_reset_pin(keys->right_gpio);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(mosaico_module_mgr_release(&keys->lease));
+        *keys = (expansion_keys_t){0};
+        return;
+    }
+
+    const mosaico_module_mgr_claim_config_t claim = {
+        .slot = MOSAICO_MODULE_MGR_SLOT_AUTO,
+        .expected_type = MOSAICO_BOARD_TYPE_INTERACT,
+    };
+    if (mosaico_module_mgr_claim(&claim, &keys->lease) != ESP_OK) {
+        return;
+    }
+    const bsp_subboard_slot_t slot = (bsp_subboard_slot_t)keys->lease.slot;
+    keys->left_gpio = bsp_subboard_map_gpio(slot, GPIO_NUM_13);
+    keys->right_gpio = bsp_subboard_map_gpio(slot, GPIO_NUM_12);
+    const gpio_config_t config = {
+        .pin_bit_mask = (1ULL << keys->left_gpio) | (1ULL << keys->right_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    const esp_err_t err = gpio_config(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Expansion key GPIO setup failed: %s", esp_err_to_name(err));
+        gpio_reset_pin(keys->left_gpio);
+        gpio_reset_pin(keys->right_gpio);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(mosaico_module_mgr_release(&keys->lease));
+        *keys = (expansion_keys_t){0};
+        return;
+    }
+    ESP_LOGI(TAG, "Expansion keys ready: slot=%s TALK=GPIO%d ENTER=GPIO%d",
+             mosaico_module_mgr_slot_to_name(keys->lease.slot), keys->left_gpio, keys->right_gpio);
+}
 
 void app_controls_feedback(void)
 {
@@ -58,28 +118,41 @@ static void poll_controls(void *arg)
 {
     (void)arg;
     button_gesture_t gesture = {0};
+    button_input_t onboard = {0};
+    expansion_keys_t expansion = {0};
     key_sequence_t sequence = {0};
-    bool raw_previous = false, stable = false, inhibited = true;
+    bool inhibited = true;
     bool old_fn = false, dirty = true, vibrating = false;
     uint8_t old_modifiers = 0, old_keys[6] = {0};
-    uint32_t raw_changed = 0, previous_generation = 0, last_reconnect = 0, vibration_at = 0;
+    uint32_t previous_generation = 0, last_reconnect = 0, vibration_at = 0;
+    uint32_t last_expansion_check = 0;
     for (;;) {
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        const bool raw = gpio_get_level(BSP_BUTTON_AI_GPIO) == BSP_BUTTON_ACTIVE_LEVEL;
-        if (raw != raw_previous) {
-            raw_previous = raw;
-            raw_changed = now;
+        const bool physical_press = button_input_step(&onboard,
+                                    gpio_get_level(BSP_BUTTON_BOOT_GPIO) == BSP_BUTTON_ACTIVE_LEVEL, now);
+        if (expansion_available && now - last_expansion_check >= EXPANSION_CHECK_MS) {
+            refresh_expansion_keys(&expansion);
+            last_expansion_check = now;
         }
-        bool physical_press = false;
-        if (now - raw_changed >= INPUT_DEBOUNCE_MS && stable != raw) {
-            stable = raw;
-            physical_press = stable;
+        bool expansion_talk_press = false;
+        bool expansion_enter = false;
+        if (expansion.lease.id) {
+            expansion_talk_press = button_input_step(&expansion.left,
+                                   gpio_get_level(expansion.left_gpio) == 0, now);
+            expansion_enter = button_input_step(&expansion.right,
+                              gpio_get_level(expansion.right_gpio) == 0, now);
         }
+        const bool expansion_idle = !expansion.left.raw && !expansion.left.down &&
+                                    !expansion.right.raw && !expansion.right.down;
+        /* A key already held at attachment must be released before use. */
+        expansion.armed |= expansion.lease.id && expansion_idle;
+        expansion_enter &= expansion.armed && !expansion.left.raw;
         portENTER_CRITICAL(&input_lock);
         const uint8_t touches = input.held;
         const key_action_t requested = input.action;
         const uint32_t request_generation = input.generation;
-        const bool feedback = input.feedback || physical_press;
+        const bool feedback = input.feedback || physical_press ||
+                              (expansion.armed && expansion_talk_press) || expansion_enter;
         input.action = KEY_ACTION_NONE;
         input.feedback = false;
         portEXIT_CRITICAL(&input_lock);
@@ -112,20 +185,21 @@ static void poll_controls(void *arg)
             last_reconnect = now;
         }
         /* Reconnection never replays held controls or queued destructive actions. */
-        if (connected && inhibited && !raw && !stable && touches == 0) {
+        if (connected && inhibited && !onboard.raw && !onboard.down && expansion_idle && touches == 0) {
             inhibited = false;
         }
         uint8_t keys[6] = {0}, modifiers = 0;
         bool fn = false;
         if (connected && !inhibited) {
-            const button_action_t action = button_gesture_step(&gesture, stable, now);
-            const bool held_fn = gesture.fn || (touches & VOICE_MASK);
+            const button_action_t action = button_gesture_step(&gesture, onboard.down, now);
+            const bool held_fn = gesture.fn || (touches & VOICE_MASK) ||
+                                 (expansion.armed && expansion.left.down);
             key_sequence_tick(&sequence, now);
             /* Never combine Command+A/Delete with Fn or replay a rejected click. */
             if (!held_fn) {
                 if (requested != KEY_ACTION_NONE && request_generation == generation) {
                     key_sequence_start(&sequence, requested);
-                } else if (action.enter) {
+                } else if (action.enter || (expansion_enter && !old_fn)) {
                     key_sequence_start(&sequence, KEY_ACTION_ENTER);
                 }
             }
@@ -162,11 +236,9 @@ esp_err_t app_controls_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     const gpio_config_t config = {
-        .pin_bit_mask = 1ULL << BSP_BUTTON_AI_GPIO,
-                             .mode = GPIO_MODE_INPUT,
-                             .pull_up_en = GPIO_PULLUP_ENABLE,
-                             .pull_down_en = GPIO_PULLDOWN_DISABLE,
-                             .intr_type = GPIO_INTR_DISABLE,
+        .pin_bit_mask = 1ULL << BSP_BUTTON_BOOT_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     esp_err_t err = gpio_config(&config);
     if (err != ESP_OK) {
@@ -177,9 +249,17 @@ esp_err_t app_controls_start(void)
     if (!motor_ready) {
         ESP_LOGW(TAG, "Haptics unavailable: %s", esp_err_to_name(err));
     }
+    err = mosaico_module_mgr_init(NULL);
+    expansion_available = err == ESP_OK;
+    if (!expansion_available) {
+        ESP_LOGW(TAG, "Expansion discovery unavailable: %s", esp_err_to_name(err));
+    }
     if (xTaskCreate(poll_controls, "mic_keys", 4096, NULL, 4, &control_task) != pdPASS) {
+        if (expansion_available) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(mosaico_module_mgr_deinit());
+        }
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "AI hold=Fn, double-click=Enter; touch voice/Enter/clear/ANSI setup enabled");
+    ESP_LOGI(TAG, "BOOT hold=F18, double-click=Enter; touch and expansion controls enabled");
     return ESP_OK;
 }

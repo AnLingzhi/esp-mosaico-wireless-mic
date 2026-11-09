@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Modified to expose the private debounced input state.
 #pragma once
 
 #include <stdbool.h>
@@ -6,6 +7,16 @@
 
 #define APP_BUTTON_HOLD_MS 250U
 #define APP_BUTTON_DOUBLE_MS 300U
+#define APP_BUTTON_DEBOUNCE_MS 30U
+
+typedef struct {
+    bool raw;
+    bool down;
+    uint32_t changed_at;
+} button_input_t;
+
+/* Update debounced state and return true once per stable press. */
+bool button_input_step(button_input_t *state, bool raw, uint32_t now);
 
 typedef struct {
     bool down;

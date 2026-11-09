@@ -1,5 +1,17 @@
 # Mosaico Mic
 
+![Mosaico 无线麦克风扩展双键版，左键听写、右键发送](docs/images/mosaico-mic-expansion-cover.png)
+
+## 扩展双键版
+
+`0.2.5-expansion` 基于 [jinhe1314 的 Wireless Mic](https://github.com/jinhe1314/esp-mosaico-wireless-mic/tree/3e4192564f09fa6a32e22cf39a72d45c65435b85) 公开源码修改。
+插上官方多功能交互模块后，按住 `KEY_L` 听写，松手后等 Codex 显示转写文字，再按一次 `KEY_R` 发回车。
+Mac 上配对 `Mosaico Mic`，在 Codex 选择该麦克风，并把「听写快捷键」设为 `F18`。
+扩展板的按键位置以模块丝印为准。[乐鑫模块说明](https://docs.espressif.com/projects/esp-dev-kits/zh_CN/latest/esp32s31/esp-mosaico/user_guide_interact.html)
+
+ESP32-S31 构建和 5 项本机测试已通过。扩展键触发听写和发送的完整流程仍待实机验证。
+改动文件保留了原有许可证标记。[Apache 2.0 许可证文本](LICENSES/Apache-2.0.txt)
+
 ESP-Mosaico / ESP32-S31 wireless microphone prototype for a Mac, using Classic
 Bluetooth HFP Hands-Free (HF) and the board's ES8311 microphone. Independent app;
 Snake source remains in the sibling project. Device Bluetooth name: **Mosaico Mic**.
@@ -13,8 +25,13 @@ Snake source remains in the sibling project. Device Bluetooth name: **Mosaico Mi
 - Touchscreen: hold-to-talk, Enter, Clear All, and a gear opening an ANSI keyboard setup page.
 - Clear All sends Command+A then Backspace to the current Mac focus. Keep the
   cursor in the intended text field; this does not inspect or target an app.
-- Physical AI button: hold for Fn, double-click for Enter. Short haptic feedback.
-- Fn requires this board's F18-to-Fn Mac mapping; direct HID Fn is not assumed.
+- Physical BOOT button while running: hold for F18, double-click for Enter.
+- Official Interaction module (left or right slot): hold `KEY_L` for F18 and
+  release to finish dictation. Press `KEY_R` once to send Enter. This works
+  after EEPROM detection, with the module's mechanical buttons.
+- For Codex, bind the hold-to-dictate shortcut to F18, select Mosaico Mic as
+  the microphone, and focus the composer. Wait for the transcript before
+  pressing `KEY_R`. Other apps that need Fn can use the Mac helper.
 - USB ESP-Iris remains the update link; retained Vibe Mode/partitions are preserved.
 - Pairing uses SSP Just Works and remains discoverable while idle. Pair only in a
   trusted environment during prototype tests. No pairing record is auto-erased.

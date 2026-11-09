@@ -6,6 +6,9 @@ dependencies:
   esp_iris:
     version: "*"
     override_path: "../../../submodule/esp-mosaico-utils/ESP-Iris/components/esp_iris"
+  mosaico_module_mgr:
+    version: "*"
+    override_path: "../../../submodule/esp-mosaico-bsp/components/mosaico_module_mgr"
   # Same BSP display dependencies as touch_counter; pin the supported LVGL API.
   lvgl/lvgl: "==9.5.0"
   espressif/esp_lvgl_adapter: "==0.6.2"
